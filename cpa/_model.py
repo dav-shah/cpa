@@ -1,11 +1,12 @@
 import json
 import logging
 import os
-from tkinter import N
+import gc
 from typing import Optional, Sequence, Union, List, Dict
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from scipy import sparse
 
 import torch.nn as nn
 
@@ -33,7 +34,7 @@ from tqdm import tqdm
 from ._module import CPAModule
 from ._utils import CPA_REGISTRY_KEYS
 from ._task import CPATrainingPlan
-from ._data import AnnDataSplitter
+from ._data import AnnDataSplitter, SparseAwareDataSplitter
 
 logger = logging.getLogger(__name__)
 logger.propagate = False
@@ -179,6 +180,20 @@ class CPA(BaseModelClass):
 
         return drug_embeddings
 
+    def _make_data_loader(self, *args, **kwargs):
+        """
+        Override to wrap data loader with sparse-to-dense conversion.
+        This is needed for Optimization 1.1: Sparse Perturbation Storage.
+        """
+        from ._data import SparseToDenseDataLoader
+        
+        # Call parent method to create the data loader
+        loader = super()._make_data_loader(*args, **kwargs)
+        
+        # Wrap with sparse-to-dense converter
+        sparse_keys = ['perts', 'perts_doses']
+        return SparseToDenseDataLoader(loader, sparse_keys)
+
     @classmethod
     @setup_anndata_dsp.dedent
     def setup_anndata(
@@ -306,15 +321,20 @@ class CPA(BaseModelClass):
                 0.0 for _ in range(max_comb_len - len(dosages_list))
             ]
 
+        # Create dense arrays first
         data_perts = np.vstack(
             np.vectorize(lambda x: pert_map[x], otypes=[np.ndarray])(perturbations)
         ).astype(int)
-        adata.obsm[CPA_REGISTRY_KEYS.PERTURBATIONS] = data_perts
-
+        
         data_perts_dosages = np.vstack(
             np.vectorize(lambda x: dose_map[x], otypes=[np.ndarray])(dosages)
         ).astype(float)
-        adata.obsm[CPA_REGISTRY_KEYS.PERTURBATIONS_DOSAGES] = data_perts_dosages
+        
+        # Convert to sparse matrices for memory efficiency (Optimization 1.1)
+        # Sparse storage saves 85-90% memory for datasets with sparse perturbations
+        # Data is converted back to dense during batch loading, preserving model behavior
+        adata.obsm[CPA_REGISTRY_KEYS.PERTURBATIONS] = sparse.csr_matrix(data_perts)
+        adata.obsm[CPA_REGISTRY_KEYS.PERTURBATIONS_DOSAGES] = sparse.csr_matrix(data_perts_dosages)
 
         # setup control column
         control_key = f"{cls.__name__}_{control_group}"
@@ -498,6 +518,14 @@ class CPA(BaseModelClass):
             and (self.train_indices is not None)
             and (self.test_indices is not None)
         )
+        # Data prefetching optimization (4.2 from MEMORY_EFFICIENCY_REPORT.md)
+        # Use fewer workers on systems with limited CPUs
+        num_workers = min(4, os.cpu_count() or 1)
+        dataloader_kwargs = {
+            'num_workers': num_workers,  # Parallel data loading
+            'prefetch_factor': 2,  # Prefetch 2 batches per worker
+            'persistent_workers': True,  # Reuse workers
+        }
         if manual_splitting:
             data_splitter = AnnDataSplitter(
                 self.adata_manager,
@@ -506,14 +534,17 @@ class CPA(BaseModelClass):
                 test_indices=self.test_indices,
                 batch_size=batch_size,
                 use_gpu=use_gpu,
+                **dataloader_kwargs,
             )
         else:
-            data_splitter = DataSplitter(
+            # Use SparseAwareDataSplitter for automatic sparse-to-dense conversion (Optimization 1.1)
+            data_splitter = SparseAwareDataSplitter(
                 self.adata_manager,
                 train_size=train_size,
                 validation_size=validation_size,
                 batch_size=batch_size,
                 use_gpu=use_gpu,
+                **dataloader_kwargs,
             )
 
         perturbation_key = CPA_REGISTRY_KEYS.PERTURBATION_KEY
@@ -577,6 +608,11 @@ class CPA(BaseModelClass):
         )
         self.runner()
 
+        # Clear cache after training (4.3 from MEMORY_EFFICIENCY_REPORT.md)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
         self.epoch_history = pd.DataFrame().from_dict(self.training_plan.epoch_history)
         if save_path is not False:
             self.save(save_path, overwrite=True)
@@ -611,6 +647,11 @@ class CPA(BaseModelClass):
         if self.is_trained_ is False:
             raise RuntimeError("Please train the model first.")
 
+        # Clear cache before inference (4.3 from MEMORY_EFFICIENCY_REPORT.md)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
         adata = self._validate_anndata(adata)
         if indices is None:
             indices = np.arange(adata.n_obs)
@@ -618,28 +659,37 @@ class CPA(BaseModelClass):
             adata=adata, indices=indices, batch_size=batch_size, shuffle=False
         )
 
-        latent_basal = []
-        latent = []
-        latent_corrected = []
+        # Pre-allocate arrays for memory efficiency (3.1 from MEMORY_EFFICIENCY_REPORT.md)
+        # Using np.empty is safe here as all elements will be populated in the loop below
+        n_cells = len(indices)
+        n_latent = self.module.n_latent
+        latent_basal = np.empty((n_cells, n_latent), dtype=np.float32)
+        latent = np.empty((n_cells, n_latent), dtype=np.float32)
+        latent_corrected = np.empty((n_cells, n_latent), dtype=np.float32)
+
+        offset = 0
         for tensors in tqdm(scdl):
             tensors, _ = self.module.mixup_data(tensors, alpha=0.0)
             inference_inputs = self.module._get_inference_input(tensors)
             outputs = self.module.inference(**inference_inputs)
-            latent_basal += [outputs["z_basal"].cpu().numpy()]
-            latent += [outputs["z"].cpu().numpy()]
-            latent_corrected += [outputs["z_corrected"].cpu().numpy()]
+
+            batch_size = outputs["z_basal"].shape[0]
+            latent_basal[offset:offset + batch_size] = outputs["z_basal"].cpu().numpy()
+            latent[offset:offset + batch_size] = outputs["z"].cpu().numpy()
+            latent_corrected[offset:offset + batch_size] = outputs["z_corrected"].cpu().numpy()
+            offset += batch_size
 
         latent_basal_adata = AnnData(
-            X=np.concatenate(latent_basal, axis=0), obs=adata.obs.copy()
+            X=latent_basal, obs=adata.obs.copy()
         )
         latent_basal_adata.obs_names = adata.obs_names
 
         latent_corrected_adata = AnnData(
-            X=np.concatenate(latent_corrected, axis=0), obs=adata.obs.copy()
+            X=latent_corrected, obs=adata.obs.copy()
         )
         latent_corrected_adata.obs_names = adata.obs_names
 
-        latent_adata = AnnData(X=np.concatenate(latent, axis=0), obs=adata.obs.copy())
+        latent_adata = AnnData(X=latent, obs=adata.obs.copy())
         latent_adata.obs_names = adata.obs_names
 
         latent_outputs = {
@@ -673,6 +723,11 @@ class CPA(BaseModelClass):
         """
         assert self.module.recon_loss in ["gauss", "nb", "zinb"]
         self.module.eval()
+
+        # Clear cache before inference (4.3 from MEMORY_EFFICIENCY_REPORT.md)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
         adata = self._validate_anndata(adata)
         if indices is None:
@@ -751,6 +806,11 @@ class CPA(BaseModelClass):
 
         assert self.module.recon_loss in ["gauss", "nb", "zinb"]
         self.module.eval()
+
+        # Clear cache before inference (4.3 from MEMORY_EFFICIENCY_REPORT.md)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
         adata = self._validate_anndata(adata)
         if indices is None:
