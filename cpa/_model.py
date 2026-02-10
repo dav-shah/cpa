@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-from tkinter import N
 from typing import Optional, Sequence, Union, List, Dict
 
 from rdkit import Chem
@@ -498,6 +497,12 @@ class CPA(BaseModelClass):
             and (self.train_indices is not None)
             and (self.test_indices is not None)
         )
+        # Data prefetching optimization (4.2 from MEMORY_EFFICIENCY_REPORT.md)
+        dataloader_kwargs = {
+            'num_workers': 4,  # Parallel data loading
+            'prefetch_factor': 2,  # Prefetch 2 batches per worker
+            'persistent_workers': True,  # Reuse workers
+        }
         if manual_splitting:
             data_splitter = AnnDataSplitter(
                 self.adata_manager,
@@ -506,6 +511,7 @@ class CPA(BaseModelClass):
                 test_indices=self.test_indices,
                 batch_size=batch_size,
                 use_gpu=use_gpu,
+                **dataloader_kwargs,
             )
         else:
             data_splitter = DataSplitter(
@@ -514,6 +520,7 @@ class CPA(BaseModelClass):
                 validation_size=validation_size,
                 batch_size=batch_size,
                 use_gpu=use_gpu,
+                **dataloader_kwargs,
             )
 
         perturbation_key = CPA_REGISTRY_KEYS.PERTURBATION_KEY
@@ -577,6 +584,12 @@ class CPA(BaseModelClass):
         )
         self.runner()
 
+        # Clear cache after training (4.3 from MEMORY_EFFICIENCY_REPORT.md)
+        import gc
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
         self.epoch_history = pd.DataFrame().from_dict(self.training_plan.epoch_history)
         if save_path is not False:
             self.save(save_path, overwrite=True)
@@ -611,6 +624,12 @@ class CPA(BaseModelClass):
         if self.is_trained_ is False:
             raise RuntimeError("Please train the model first.")
 
+        # Clear cache before inference (4.3 from MEMORY_EFFICIENCY_REPORT.md)
+        import gc
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
         adata = self._validate_anndata(adata)
         if indices is None:
             indices = np.arange(adata.n_obs)
@@ -618,28 +637,36 @@ class CPA(BaseModelClass):
             adata=adata, indices=indices, batch_size=batch_size, shuffle=False
         )
 
-        latent_basal = []
-        latent = []
-        latent_corrected = []
+        # Pre-allocate arrays for memory efficiency (3.1 from MEMORY_EFFICIENCY_REPORT.md)
+        n_cells = len(indices)
+        n_latent = self.module.n_latent
+        latent_basal = np.empty((n_cells, n_latent), dtype=np.float32)
+        latent = np.empty((n_cells, n_latent), dtype=np.float32)
+        latent_corrected = np.empty((n_cells, n_latent), dtype=np.float32)
+        
+        offset = 0
         for tensors in tqdm(scdl):
             tensors, _ = self.module.mixup_data(tensors, alpha=0.0)
             inference_inputs = self.module._get_inference_input(tensors)
             outputs = self.module.inference(**inference_inputs)
-            latent_basal += [outputs["z_basal"].cpu().numpy()]
-            latent += [outputs["z"].cpu().numpy()]
-            latent_corrected += [outputs["z_corrected"].cpu().numpy()]
+            
+            batch_size = outputs["z_basal"].shape[0]
+            latent_basal[offset:offset+batch_size] = outputs["z_basal"].cpu().numpy()
+            latent[offset:offset+batch_size] = outputs["z"].cpu().numpy()
+            latent_corrected[offset:offset+batch_size] = outputs["z_corrected"].cpu().numpy()
+            offset += batch_size
 
         latent_basal_adata = AnnData(
-            X=np.concatenate(latent_basal, axis=0), obs=adata.obs.copy()
+            X=latent_basal, obs=adata.obs.copy()
         )
         latent_basal_adata.obs_names = adata.obs_names
 
         latent_corrected_adata = AnnData(
-            X=np.concatenate(latent_corrected, axis=0), obs=adata.obs.copy()
+            X=latent_corrected, obs=adata.obs.copy()
         )
         latent_corrected_adata.obs_names = adata.obs_names
 
-        latent_adata = AnnData(X=np.concatenate(latent, axis=0), obs=adata.obs.copy())
+        latent_adata = AnnData(X=latent, obs=adata.obs.copy())
         latent_adata.obs_names = adata.obs_names
 
         latent_outputs = {
@@ -673,6 +700,12 @@ class CPA(BaseModelClass):
         """
         assert self.module.recon_loss in ["gauss", "nb", "zinb"]
         self.module.eval()
+
+        # Clear cache before inference (4.3 from MEMORY_EFFICIENCY_REPORT.md)
+        import gc
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
         adata = self._validate_anndata(adata)
         if indices is None:
@@ -751,6 +784,12 @@ class CPA(BaseModelClass):
 
         assert self.module.recon_loss in ["gauss", "nb", "zinb"]
         self.module.eval()
+
+        # Clear cache before inference (4.3 from MEMORY_EFFICIENCY_REPORT.md)
+        import gc
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
 
         adata = self._validate_anndata(adata)
         if indices is None:
