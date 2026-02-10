@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import gc
 from typing import Optional, Sequence, Union, List, Dict
 
 from rdkit import Chem
@@ -498,8 +499,10 @@ class CPA(BaseModelClass):
             and (self.test_indices is not None)
         )
         # Data prefetching optimization (4.2 from MEMORY_EFFICIENCY_REPORT.md)
+        # Use fewer workers on systems with limited CPUs
+        num_workers = min(4, os.cpu_count() or 1)
         dataloader_kwargs = {
-            'num_workers': 4,  # Parallel data loading
+            'num_workers': num_workers,  # Parallel data loading
             'prefetch_factor': 2,  # Prefetch 2 batches per worker
             'persistent_workers': True,  # Reuse workers
         }
@@ -585,7 +588,6 @@ class CPA(BaseModelClass):
         self.runner()
 
         # Clear cache after training (4.3 from MEMORY_EFFICIENCY_REPORT.md)
-        import gc
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -625,7 +627,6 @@ class CPA(BaseModelClass):
             raise RuntimeError("Please train the model first.")
 
         # Clear cache before inference (4.3 from MEMORY_EFFICIENCY_REPORT.md)
-        import gc
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -638,22 +639,23 @@ class CPA(BaseModelClass):
         )
 
         # Pre-allocate arrays for memory efficiency (3.1 from MEMORY_EFFICIENCY_REPORT.md)
+        # Using np.empty is safe here as all elements will be populated in the loop below
         n_cells = len(indices)
         n_latent = self.module.n_latent
         latent_basal = np.empty((n_cells, n_latent), dtype=np.float32)
         latent = np.empty((n_cells, n_latent), dtype=np.float32)
         latent_corrected = np.empty((n_cells, n_latent), dtype=np.float32)
-        
+
         offset = 0
         for tensors in tqdm(scdl):
             tensors, _ = self.module.mixup_data(tensors, alpha=0.0)
             inference_inputs = self.module._get_inference_input(tensors)
             outputs = self.module.inference(**inference_inputs)
-            
+
             batch_size = outputs["z_basal"].shape[0]
-            latent_basal[offset:offset+batch_size] = outputs["z_basal"].cpu().numpy()
-            latent[offset:offset+batch_size] = outputs["z"].cpu().numpy()
-            latent_corrected[offset:offset+batch_size] = outputs["z_corrected"].cpu().numpy()
+            latent_basal[offset:offset + batch_size] = outputs["z_basal"].cpu().numpy()
+            latent[offset:offset + batch_size] = outputs["z"].cpu().numpy()
+            latent_corrected[offset:offset + batch_size] = outputs["z_corrected"].cpu().numpy()
             offset += batch_size
 
         latent_basal_adata = AnnData(
@@ -702,7 +704,6 @@ class CPA(BaseModelClass):
         self.module.eval()
 
         # Clear cache before inference (4.3 from MEMORY_EFFICIENCY_REPORT.md)
-        import gc
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -786,7 +787,6 @@ class CPA(BaseModelClass):
         self.module.eval()
 
         # Clear cache before inference (4.3 from MEMORY_EFFICIENCY_REPORT.md)
-        import gc
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
