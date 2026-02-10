@@ -58,13 +58,17 @@ try:
     perts_key = 'perts'
     perts_doses_key = 'perts_doses'
     
+    def calc_sparsity(sparse_mat):
+        """Calculate sparsity percentage of a sparse matrix."""
+        return 1 - sparse_mat.nnz / np.prod(sparse_mat.shape)
+    
     if perts_key in dataset.obsm:
         is_sparse_perts = sparse.issparse(dataset.obsm[perts_key])
         print(f"   Perturbations stored as sparse: {is_sparse_perts}")
         if is_sparse_perts:
             print(f"   Perturbations matrix type: {type(dataset.obsm[perts_key])}")
             print(f"   Perturbations shape: {dataset.obsm[perts_key].shape}")
-            print(f"   Perturbations sparsity: {1 - dataset.obsm[perts_key].nnz / np.prod(dataset.obsm[perts_key].shape):.2%}")
+            print(f"   Perturbations sparsity: {calc_sparsity(dataset.obsm[perts_key]):.2%}")
     
     if perts_doses_key in dataset.obsm:
         is_sparse_doses = sparse.issparse(dataset.obsm[perts_doses_key])
@@ -72,7 +76,7 @@ try:
         if is_sparse_doses:
             print(f"   Dosages matrix type: {type(dataset.obsm[perts_doses_key])}")
             print(f"   Dosages shape: {dataset.obsm[perts_doses_key].shape}")
-            print(f"   Dosages sparsity: {1 - dataset.obsm[perts_doses_key].nnz / np.prod(dataset.obsm[perts_doses_key].shape):.2%}")
+            print(f"   Dosages sparsity: {calc_sparsity(dataset.obsm[perts_doses_key]):.2%}")
     
     # Estimate memory savings
     print("\n4. Estimating memory savings...")

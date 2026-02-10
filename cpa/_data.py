@@ -28,7 +28,7 @@ class SparseToDenseDataLoader:
                     if sparse.issparse(batch[key]):
                         # Convert scipy sparse matrix to dense array, then to tensor
                         dense_array = batch[key].toarray()
-                        batch[key] = torch.from_numpy(dense_array).to(batch[key].dtype if hasattr(batch[key], 'dtype') else torch.float32)
+                        batch[key] = torch.from_numpy(dense_array)
                     elif isinstance(batch[key], np.ndarray):
                         # Already dense numpy array, just convert to tensor
                         if not isinstance(batch[key], torch.Tensor):
