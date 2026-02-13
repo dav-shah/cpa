@@ -192,6 +192,13 @@ class CPA(BaseModelClass):
         
         # Wrap with sparse-to-dense converter
         sparse_keys = ['perts', 'perts_doses']
+        
+        # NEW: Automatically handle DEG masks if they exist
+        if CPA_REGISTRY_KEYS.DEG_MASK:
+            sparse_keys.append(CPA_REGISTRY_KEYS.DEG_MASK)
+        if CPA_REGISTRY_KEYS.DEG_MASK_R2:
+            sparse_keys.append(CPA_REGISTRY_KEYS.DEG_MASK_R2)
+            
         return SparseToDenseDataLoader(loader, sparse_keys)
 
     @classmethod
@@ -385,41 +392,45 @@ class CPA(BaseModelClass):
 
         if deg_uns_key:
             n_deg_r2 = kwargs.pop("n_deg_r2", 10)
-
-            cov_cond_unique = np.unique(adata.obs[deg_uns_cat_key].astype(str).values)
-
-            cov_cond_map = {}
-            cov_cond_map_r2 = {}
-            for cov_cond in tqdm(cov_cond_unique):
+            
+            # 1. Map conditions to integer codes efficiently
+            # This avoids storing millions of strings and simplifies lookup
+            codes, uniques = pd.factorize(adata.obs[deg_uns_cat_key].astype(str), sort=True)
+            
+            # 2. Pre-compute sparse masks for unique conditions only
+            # (Shape: N_conditions x N_genes) - Tiny memory footprint
+            unique_masks = []
+            unique_masks_r2 = []
+            
+            for cov_cond in tqdm(uniques):
                 if cov_cond in adata.uns[deg_uns_key].keys():
-                    mask_hvg = adata.var_names.isin(
-                        adata.uns[deg_uns_key][cov_cond]
-                    ).astype(int)
-                    mask_hvg_r2 = adata.var_names.isin(
-                        adata.uns[deg_uns_key][cov_cond][:n_deg_r2]
-                    ).astype(int)
-                    cov_cond_map[cov_cond] = list(mask_hvg)
-                    cov_cond_map_r2[cov_cond] = list(mask_hvg_r2)
+                    # Create boolean mask (1 for DEGs, 0 for others)
+                    mask_hvg = adata.var_names.isin(adata.uns[deg_uns_key][cov_cond]).astype(int)
+                    mask_hvg_r2 = adata.var_names.isin(adata.uns[deg_uns_key][cov_cond][:n_deg_r2]).astype(int)
                 else:
-                    no_mask = list(np.ones(shape=(adata.n_vars,)))
-                    cov_cond_map[cov_cond] = no_mask
-                    cov_cond_map_r2[cov_cond] = no_mask
-
-            mask = np.vstack(
-                np.vectorize(lambda x: cov_cond_map[x], otypes=[np.ndarray])(
-                    adata.obs[deg_uns_cat_key].astype(str).values
-                )
-            )
-            mask_r2 = np.vstack(
-                np.vectorize(lambda x: cov_cond_map[x], otypes=[np.ndarray])(
-                    adata.obs[deg_uns_cat_key].astype(str).values
-                )
-            )
+                    # Fallback: all genes (be careful, this row is dense-ish, but only 1 row)
+                    mask_hvg = np.ones(adata.n_vars)
+                    mask_hvg_r2 = np.ones(adata.n_vars)
+                    
+                unique_masks.append(sparse.csr_matrix(mask_hvg))
+                unique_masks_r2.append(sparse.csr_matrix(mask_hvg_r2))
+            
+            # Stack unique masks
+            U_mask = sparse.vstack(unique_masks).tocsr()
+            U_mask_r2 = sparse.vstack(unique_masks_r2).tocsr()
+            
+            # 3. Broadcast to full dataset shape using sparse slicing
+            # (Shape: N_cells x N_genes) - Memory efficient due to sparsity
+            # "codes" acts as the row selector
+            mask_sparse = U_mask[codes, :]
+            mask_sparse_r2 = U_mask_r2[codes, :]
 
             CPA_REGISTRY_KEYS.DEG_MASK = "deg_mask"
             CPA_REGISTRY_KEYS.DEG_MASK_R2 = "deg_mask_r2"
-            adata.obsm[CPA_REGISTRY_KEYS.DEG_MASK] = np.array(mask)
-            adata.obsm[CPA_REGISTRY_KEYS.DEG_MASK_R2] = np.array(mask_r2)
+            
+            # Store as sparse matrices
+            adata.obsm[CPA_REGISTRY_KEYS.DEG_MASK] = mask_sparse
+            adata.obsm[CPA_REGISTRY_KEYS.DEG_MASK_R2] = mask_sparse_r2
 
             anndata_fields.append(
                 ObsmField(
