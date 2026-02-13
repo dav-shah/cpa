@@ -8,6 +8,9 @@ import cpa
 
 def generate_synth_with_deg():
     """Generate synthetic data with DEG information for testing sparse mask optimization."""
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
     n_cells = 2000
     n_genes = 500
     X = np.random.randint(low=0, high=1000, size=(n_cells, n_genes))

@@ -10,6 +10,9 @@ from scipy import sparse
 def test_sparse_mask_creation_logic():
     """Test the sparse mask creation logic independently."""
     
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
     # Simulate the data
     n_cells = 1000
     n_genes = 500
@@ -124,6 +127,9 @@ def test_sparse_mask_creation_logic():
 
 def test_old_vs_new_implementation():
     """Compare the old and new implementations to ensure they produce the same results."""
+    
+    # Set random seed for reproducibility
+    np.random.seed(123)
     
     print("\nComparing old vs new implementation...")
     
