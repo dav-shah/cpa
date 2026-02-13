@@ -193,12 +193,13 @@ class CPA(BaseModelClass):
         # Wrap with sparse-to-dense converter
         sparse_keys = ['perts', 'perts_doses']
         
-        # NEW: Automatically handle DEG masks if they exist
-        # Check if DEG masks are registered (they're set to string values in setup_anndata)
-        if CPA_REGISTRY_KEYS.DEG_MASK is not None and CPA_REGISTRY_KEYS.DEG_MASK in self.adata_manager.registry.get("field_registries", {}):
-            sparse_keys.append(CPA_REGISTRY_KEYS.DEG_MASK)
-        if CPA_REGISTRY_KEYS.DEG_MASK_R2 is not None and CPA_REGISTRY_KEYS.DEG_MASK_R2 in self.adata_manager.registry.get("field_registries", {}):
-            sparse_keys.append(CPA_REGISTRY_KEYS.DEG_MASK_R2)
+        # NEW: Automatically handle DEG masks if they exist in the registered fields
+        # Check if DEG masks are registered in this model's adata_manager
+        field_registries = self.adata_manager.registry.get("field_registries", {})
+        if "deg_mask" in field_registries:
+            sparse_keys.append("deg_mask")
+        if "deg_mask_r2" in field_registries:
+            sparse_keys.append("deg_mask_r2")
             
         return SparseToDenseDataLoader(loader, sparse_keys)
 
