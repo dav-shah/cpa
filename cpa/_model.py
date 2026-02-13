@@ -113,6 +113,11 @@ class CPA(BaseModelClass):
             # get morgan fingerprint vectors for drug embeddings
             drug_embeddings = self.__get_rdkit_embeddings()
             hyper_params['drug_embeddings'] = drug_embeddings
+        
+        # Load DEG masks if available
+        if 'deg_mask_lookup' in adata.uns:
+            hyper_params['deg_mask_lookup'] = adata.uns['deg_mask_lookup']
+            hyper_params['deg_mask_r2_lookup'] = adata.uns['deg_mask_r2_lookup']
 
         self.module = CPAModule(
             n_genes=adata.n_vars,
@@ -193,13 +198,11 @@ class CPA(BaseModelClass):
         # Wrap with sparse-to-dense converter
         sparse_keys = ['perts', 'perts_doses']
         
-        # NEW: Automatically handle DEG masks if they exist in the registered fields
-        # Check if DEG masks are registered in this model's adata_manager
-        field_registries = self.adata_manager.registry.get("field_registries", {})
-        if "deg_mask" in field_registries:
-            sparse_keys.append("deg_mask")
-        if "deg_mask_r2" in field_registries:
-            sparse_keys.append("deg_mask_r2")
+        # NEW: Automatically handle DEG masks if they exist
+        if CPA_REGISTRY_KEYS.DEG_MASK:
+            sparse_keys.append(CPA_REGISTRY_KEYS.DEG_MASK)
+        if CPA_REGISTRY_KEYS.DEG_MASK_R2:
+            sparse_keys.append(CPA_REGISTRY_KEYS.DEG_MASK_R2)
             
         return SparseToDenseDataLoader(loader, sparse_keys)
 
@@ -421,35 +424,32 @@ class CPA(BaseModelClass):
             U_mask = sparse.vstack(unique_masks).tocsr()
             U_mask_r2 = sparse.vstack(unique_masks_r2).tocsr()
             
-            # 3. Broadcast to full dataset shape using sparse slicing
-            # (Shape: N_cells x N_genes) - Memory efficient due to sparsity
-            # "codes" acts as the row selector
-            mask_sparse = U_mask[codes, :]
-            mask_sparse_r2 = U_mask_r2[codes, :]
-
-            CPA_REGISTRY_KEYS.DEG_MASK = "deg_mask"
-            CPA_REGISTRY_KEYS.DEG_MASK_R2 = "deg_mask_r2"
+            # OPTIMIZATION 2.0: Use Lookup Table + Index instead of expanded matrix
+            # Expanding to (N_cells x N_genes) causes OOM (80GB+) even with sparse format due to overhead.
+            # Instead, we store the lookup table (N_conditions x N_genes) and an index column.
             
-            # Store as sparse matrices
-            adata.obsm[CPA_REGISTRY_KEYS.DEG_MASK] = mask_sparse
-            adata.obsm[CPA_REGISTRY_KEYS.DEG_MASK_R2] = mask_sparse_r2
-
+            # Convert lookup tables to dense (small enough: ~100 rows x 5000 cols)
+            # Store in uns for retrieval during init
+            adata.uns['deg_mask_lookup'] = U_mask.toarray().astype('float32')
+            adata.uns['deg_mask_r2_lookup'] = U_mask_r2.toarray().astype('float32')
+            
+            # Store index column in obs
+            idx_key = "cpa_deg_mask_idx"
+            adata.obs[idx_key] = codes
+            
+            CPA_REGISTRY_KEYS.DEG_MASK_IDX = "deg_mask_idx"
+            
+            # Register the INDEX column, not the mask matrix
             anndata_fields.append(
-                ObsmField(
-                    CPA_REGISTRY_KEYS.DEG_MASK,
-                    CPA_REGISTRY_KEYS.DEG_MASK,
-                    is_count_data=True,
-                    correct_data_format=True,
+                NumericalObsField(
+                    registry_key=CPA_REGISTRY_KEYS.DEG_MASK_IDX,
+                    attr_key=idx_key,
                 )
             )
-            anndata_fields.append(
-                ObsmField(
-                    CPA_REGISTRY_KEYS.DEG_MASK_R2,
-                    CPA_REGISTRY_KEYS.DEG_MASK_R2,
-                    is_count_data=True,
-                    correct_data_format=True,
-                )
-            )
+            
+            # Define keys for module usage (will be None in registry, handled manually)
+            CPA_REGISTRY_KEYS.DEG_MASK = "deg_mask" 
+            CPA_REGISTRY_KEYS.DEG_MASK_R2 = "deg_mask_r2"
 
         adata_manager = AnnDataManager(
             fields=anndata_fields, setup_method_args=setup_method_args

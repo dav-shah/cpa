@@ -25,6 +25,7 @@ class _REGISTRY_KEYS:
     CONTROL_KEY: str = None
     DEG_MASK: str = None
     DEG_MASK_R2: str = None
+    DEG_MASK_IDX: str = None
     PADDING_IDX: int = 0
 
 

@@ -87,8 +87,18 @@ class CPAModule(BaseModuleClass):
                  dropout_rate_decoder: float = 0.0,
                  variational: bool = False,
                  seed: int = 0,
+                 deg_mask_lookup: Optional[np.ndarray] = None,
+                 deg_mask_r2_lookup: Optional[np.ndarray] = None,
                  ):
         super().__init__()
+
+        # Register lookup tables
+        if deg_mask_lookup is not None:
+            self.register_buffer('deg_mask_lookup', torch.as_tensor(deg_mask_lookup))
+            self.register_buffer('deg_mask_r2_lookup', torch.as_tensor(deg_mask_r2_lookup))
+        else:
+            self.deg_mask_lookup = None
+            self.deg_mask_r2_lookup = None
 
         recon_loss = recon_loss.lower()
         assert recon_loss in ['gauss', 'zinb', 'nb']
@@ -409,8 +419,13 @@ class CPAModule(BaseModuleClass):
 
                     x_i *= deg_mask
                     x_pred_mean *= deg_mask
+                    x_pred_var *= deg_mask                
+                elif self.deg_mask_r2_lookup is not None and CPA_REGISTRY_KEYS.DEG_MASK_IDX in tensors.keys():
+                    batch_indices = tensors[CPA_REGISTRY_KEYS.DEG_MASK_IDX][i_mask].long().flatten()
+                    deg_mask = self.deg_mask_r2_lookup[batch_indices]
+                    x_i *= deg_mask
+                    x_pred_mean *= deg_mask
                     x_pred_var *= deg_mask
-
                 x_pred_mean = torch.nan_to_num(x_pred_mean, nan=0, posinf=1e3, neginf=-1e3)
                 x_pred_var = torch.nan_to_num(x_pred_var, nan=0, posinf=1e3, neginf=-1e3)
 
@@ -426,9 +441,15 @@ class CPAModule(BaseModuleClass):
 
                 x_pred = torch.nan_to_num(x_pred, nan=0, posinf=1e3, neginf=-1e3)
 
+                # NEW: Optimized deg_mask lookup
                 if CPA_REGISTRY_KEYS.DEG_MASK_R2 in tensors.keys():
                     deg_mask = tensors[f'{CPA_REGISTRY_KEYS.DEG_MASK_R2}'][i_mask, :]
-
+                    x_i *= deg_mask
+                    x_pred *= deg_mask
+                elif self.deg_mask_r2_lookup is not None and CPA_REGISTRY_KEYS.DEG_MASK_IDX in tensors.keys():
+                    # Lookup via index
+                    batch_indices = tensors[CPA_REGISTRY_KEYS.DEG_MASK_IDX][i_mask].long().flatten()
+                    deg_mask = self.deg_mask_r2_lookup[batch_indices]
                     x_i *= deg_mask
                     x_pred *= deg_mask
 
