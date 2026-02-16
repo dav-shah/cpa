@@ -28,6 +28,12 @@ from anndata import AnnData
 from scvi.model.base import BaseModelClass
 from scvi.train import TrainRunner
 from scvi.train._callbacks import SaveBestState
+
+# Imports for custom load function
+from scvi.model.base._utils import _load_saved_files, _initialize_model, _validate_var_names
+from scvi.model._utils import parse_use_gpu_arg
+from scvi.data._constants import _SETUP_ARGS_KEY, _SETUP_METHOD_NAME, _MODEL_NAME_KEY
+
 from scvi.utils import setup_anndata_dsp
 from tqdm import tqdm
 
@@ -1103,6 +1109,9 @@ class CPA(BaseModelClass):
         :class:`~scvi.core.models.CPA`
             Restored model from the specified directory.
         """
+        load_adata = adata is None
+        _, _, device = parse_use_gpu_arg(use_gpu)
+
         # load public dictionaries
         with open(os.path.join(dir_path, "CPA_info.json")) as f:
             total_dict = json.load(f)
@@ -1111,13 +1120,57 @@ class CPA(BaseModelClass):
             cls.covars_encoder = total_dict["covars_encoder"]
             cls.pert_smiles_map = total_dict.get("pert_smiles_map", None)
             
+        (
+            attr_dict,
+            var_names,
+            model_state_dict,
+            new_adata,
+        ) = _load_saved_files(
+            dir_path,
+            load_adata,
+            map_location=device,
+        )
+        adata = new_adata if new_adata is not None else adata
 
-        model = super().load(dir_path, adata=adata, use_gpu=use_gpu)
+        _validate_var_names(adata, var_names)
+
+        registry = attr_dict.pop("registry_")
+        if _MODEL_NAME_KEY in registry and registry[_MODEL_NAME_KEY] != cls.__name__:
+            raise ValueError("It appears you are loading a model from a different class.")
+
+        if _SETUP_ARGS_KEY not in registry:
+            raise ValueError(
+                "Saved model does not contain original setup inputs. "
+                "Cannot load the original setup."
+            )
+
+        # Calling ``setup_anndata`` method with the original arguments passed into
+        # the saved model. This enables simple backwards compatibility in the case of
+        # newly introduced fields or parameters.
+        method_name = registry.get(_SETUP_METHOD_NAME, "setup_anndata")
         
-        if adata is not None and extend_categories:
-            model.adata_manager.transfer_fields(adata, extend_categories=True)
-            cls.register_manager(model.get_anndata_manager(adata, required=True))
+        # Inject extend_categories into setup arguments
+        setup_args = registry[_SETUP_ARGS_KEY]
+        setup_args['extend_categories'] = extend_categories
+        
+        getattr(cls, method_name)(
+            adata, source_registry=registry, **setup_args
+        )
 
+        model = _initialize_model(cls, adata, attr_dict)
+        model.module.on_load(model)
+        model.module.load_state_dict(model_state_dict)
+
+        model.to_device(device)
+        model.module.eval()
+        
+        # Validation might fail if extend_categories was used during setup_anndata but 
+        # _validate_anndata is strict.
+        # However, _validate_anndata calls self.adata_manager.validate() which checks
+        # if data is registered properly. Since we registered with extend_categories=True,
+        # it should be fine.
+        model._validate_anndata(adata)
+        
         try:
             model.epoch_history = pd.read_csv(os.path.join(dir_path, "history.csv"))
         except:
