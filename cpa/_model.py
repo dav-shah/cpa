@@ -1082,6 +1082,7 @@ class CPA(BaseModelClass):
         dir_path: str,
         adata: Optional[AnnData] = None,
         use_gpu: Optional[Union[str, int, bool]] = None,
+        extend_categories: bool = False,
     ):
         """
         Loads the model from the specified directory.
@@ -1094,6 +1095,8 @@ class CPA(BaseModelClass):
             Annotated data matrix. Will call `cpa.CPA.setup_anndata` on the data after model restoration.
         use_gpu : `bool` or `str` or `int`, optional (default: `None`)
             Whether a GPU should be used. If `True`, will use GPU. 
+        extend_categories : `bool`, optional (default: `False`)
+            If `True`, allows for new categories in the covariates and perturbation keys. 
         
         Returns
         -------
@@ -1109,7 +1112,11 @@ class CPA(BaseModelClass):
             cls.pert_smiles_map = total_dict.get("pert_smiles_map", None)
             
 
-        model = super().load(dir_path, adata, use_gpu)
+        model = super().load(dir_path, adata=adata, use_gpu=use_gpu)
+        
+        if adata is not None and extend_categories:
+            model.adata_manager.transfer_fields(adata, extend_categories=True)
+            cls.register_manager(model.get_anndata_manager(adata, required=True))
 
         try:
             model.epoch_history = pd.read_csv(os.path.join(dir_path, "history.csv"))
