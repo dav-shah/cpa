@@ -63,6 +63,15 @@ class CPA(BaseModelClass):
     doser_type: str
         Type of doser network. Either `sigm`, `logsigm` or `mlp`.
 
+    use_parallel_encoder: bool, optional
+        Whether to use a parallel encoder to regularize the latent space. By default False.
+
+    parallel_distill_weight: float, optional
+        Weight for the parallel encoder MSE distill loss. By default 1.0.
+
+    parallel_recon_weight: float, optional
+        Weight for the parallel encoder reconstruction loss. By default 0.01.
+
     split_key : str, optional
         Key used to split the data between train test and validation.
         This must correspond to a observation key for the adata, composed of values
@@ -103,6 +112,9 @@ class CPA(BaseModelClass):
         valid_split: Union[str, List[str]] = "test",
         test_split: Union[str, List[str]] = "ood",
         use_rdkit_embeddings: bool = False,
+        use_parallel_encoder: bool = False,
+        parallel_distill_weight: float = 1.0,
+        parallel_recon_weight: float = 0.01,
         **hyper_params,
     ):
         super().__init__(adata)
@@ -129,6 +141,9 @@ class CPA(BaseModelClass):
             n_genes=adata.n_vars,
             n_perts=len(self.pert_encoder),
             covars_encoder=self.covars_encoder,
+            use_parallel_encoder=use_parallel_encoder,
+            parallel_distill_weight=parallel_distill_weight,
+            parallel_recon_weight=parallel_recon_weight,
             **hyper_params,
         ).float()
 
@@ -282,7 +297,7 @@ class CPA(BaseModelClass):
         if batch_key is not None:
             keys = [batch_key] + keys
 
-        adata.obs[category_key] = adata.obs[keys].apply(lambda x: "_".join(x), axis=1)
+        adata.obs[category_key] = adata.obs[keys].astype(str).apply(lambda x: "_".join(x), axis=1) if not adata.obs[keys].empty else pd.Series([], dtype=str)
         CPA_REGISTRY_KEYS.CATEGORY_KEY = category_key
 
         if cls.pert_encoder is None:
@@ -685,6 +700,7 @@ class CPA(BaseModelClass):
         latent_basal = np.empty((n_cells, n_latent), dtype=np.float32)
         latent = np.empty((n_cells, n_latent), dtype=np.float32)
         latent_corrected = np.empty((n_cells, n_latent), dtype=np.float32)
+        latent_parallel = np.empty((n_cells, n_latent), dtype=np.float32) if self.module.use_parallel_encoder else None
 
         offset = 0
         for tensors in tqdm(scdl):
@@ -696,6 +712,8 @@ class CPA(BaseModelClass):
             latent_basal[offset:offset + batch_size] = outputs["z_basal"].cpu().numpy()
             latent[offset:offset + batch_size] = outputs["z"].cpu().numpy()
             latent_corrected[offset:offset + batch_size] = outputs["z_corrected"].cpu().numpy()
+            if latent_parallel is not None:
+                latent_parallel[offset:offset + batch_size] = outputs["z_parallel"].cpu().numpy()
             offset += batch_size
 
         latent_basal_adata = AnnData(
@@ -716,6 +734,11 @@ class CPA(BaseModelClass):
             "latent_basal": latent_basal_adata,
             "latent_after": latent_adata,
         }
+
+        if latent_parallel is not None:
+            latent_parallel_adata = AnnData(X=latent_parallel, obs=adata.obs.copy())
+            latent_parallel_adata.obs_names = adata.obs_names
+            latent_outputs["latent_parallel"] = latent_parallel_adata
 
         return latent_outputs
 

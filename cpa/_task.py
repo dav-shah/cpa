@@ -52,6 +52,7 @@ class CPATrainingPlan(TrainingPlan):
             gradient_clip_value: Optional[float] = 3.0,
             drug_weights: Optional[list] = None,
             adv_loss: Optional[str] = 'cce',
+            n_epochs_parallel_recon_warmup: Optional[int] = None,
     ):
         """
         Training plan for the CPA model. 
@@ -120,6 +121,9 @@ class CPATrainingPlan(TrainingPlan):
             Weights for the perturbations to be used in the adversarial loss.
         adv_loss: Optional[str]
             Adversarial loss to be used. Can be either 'cce' or 'focal'.
+        n_epochs_parallel_recon_warmup: Optional[int]
+            Number of epochs to warmup the parallel reconstruction loss. During warmup, 
+            parallel_recon_weight scales from 0 to full value. After warmup, it uses full weight.
         """
         super().__init__(
             module=module,
@@ -150,6 +154,8 @@ class CPATrainingPlan(TrainingPlan):
         self.n_steps_adv_warmup = n_steps_adv_warmup
         self.n_epochs_adv_warmup = n_epochs_adv_warmup
 
+        self.n_epochs_parallel_recon_warmup = n_epochs_parallel_recon_warmup
+
         self.n_epochs_verbose = n_epochs_verbose
 
         self.adv_steps = adv_steps
@@ -168,7 +174,7 @@ class CPATrainingPlan(TrainingPlan):
         self.do_clip_grad = do_clip_grad
         self.gradient_clip_value = gradient_clip_value
 
-        self.metrics = ['recon_loss', 'KL',
+        self.metrics = ['recon_loss', 'KL', 'parallel_loss', 'parallel_mse', 'parallel_recon',
                         'disnt_basal', 'disnt_after',
                         'r2_mean', 'r2_var',
                         'adv_loss', 'penalty_adv', 'adv_perts', 'acc_perts', 'penalty_perts']
@@ -260,6 +266,23 @@ class CPATrainingPlan(TrainingPlan):
                 return self.mixup_alpha
         else:
             return self.mixup_alpha
+
+    @property
+    def parallel_recon_weight_active(self):
+        """Warmup schedule for parallel reconstruction loss weight."""
+        if self.n_epochs_parallel_recon_warmup is not None:
+            current_epoch = self.current_epoch
+
+            if self.n_epochs_pretrain_ae:
+                current_epoch -= self.n_epochs_pretrain_ae
+
+            if current_epoch <= self.n_epochs_parallel_recon_warmup:
+                proportion = current_epoch / self.n_epochs_parallel_recon_warmup
+                return self.module.parallel_recon_weight * proportion
+            else:
+                return self.module.parallel_recon_weight
+        else:
+            return self.module.parallel_recon_weight
 
     @property
     def do_start_adv_training(self):
@@ -368,6 +391,9 @@ class CPATrainingPlan(TrainingPlan):
                     list(filter(lambda p: p.requires_grad, self.module.pert_network.pert_embedding.parameters())) + \
                     list(filter(lambda p: p.requires_grad, self.module.covars_embeddings.parameters()))
 
+        if self.module.use_parallel_encoder:
+            ae_params += list(filter(lambda p: p.requires_grad, self.module.parallel_encoder.parameters()))
+
         if self.module.recon_loss in ['zinb', 'nb']:
             ae_params += [self.module.px_r]
 
@@ -413,10 +439,11 @@ class CPATrainingPlan(TrainingPlan):
                                                            'mixup_lambda': mixup_lambda,
                                                        })
 
-        recon_loss, kl_loss = self.module.loss(
+        recon_loss, kl_loss, parallel_loss, parallel_mse, parallel_recon = self.module.loss(
             tensors=batch,
             inference_outputs=inf_outputs,
             generative_outputs=gen_outputs,
+            parallel_recon_weight_active=self.parallel_recon_weight_active,
         )
 
         if self.do_start_adv_training:
@@ -431,7 +458,7 @@ class CPATrainingPlan(TrainingPlan):
                                                     mixup_lambda=mixup_lambda,
                                                     compute_penalty=False)
 
-                loss = recon_loss + self.kl_weight * kl_loss - self.adv_lambda * adv_results['adv_loss']
+                loss = recon_loss + self.kl_weight * kl_loss - self.adv_lambda * adv_results['adv_loss'] + parallel_loss
 
                 self.manual_backward(loss)
 
@@ -496,7 +523,7 @@ class CPATrainingPlan(TrainingPlan):
                                                     mixup_lambda=mixup_lambda,
                                                     compute_penalty=False)
 
-                loss = recon_loss + self.kl_weight * kl_loss - self.adv_lambda * adv_results['adv_loss']
+                loss = recon_loss + self.kl_weight * kl_loss - self.adv_lambda * adv_results['adv_loss'] + parallel_loss
 
                 self.manual_backward(loss)
 
@@ -516,7 +543,7 @@ class CPATrainingPlan(TrainingPlan):
 
             z_basal = inf_outputs['z_basal']
 
-            loss = recon_loss + self.kl_weight * kl_loss
+            loss = recon_loss + self.kl_weight * kl_loss + parallel_loss
 
             self.manual_backward(loss)
 
@@ -557,6 +584,9 @@ class CPATrainingPlan(TrainingPlan):
         results = adv_results.copy()
         results.update({'recon_loss': recon_loss.item()})
         results.update({'KL': kl_loss.item()})
+        results.update({'parallel_loss': parallel_loss.item()})
+        results.update({'parallel_mse': parallel_mse.item()})
+        results.update({'parallel_recon': parallel_recon.item()})
 
         results.update({'r2_mean': r2_mean, 'r2_var': r2_var})
         results.update({'r2_mean_lfc': 0.0, 'r2_var_lfc': 0.0})
@@ -583,6 +613,9 @@ class CPATrainingPlan(TrainingPlan):
         self.epoch_history['mode'].append('train')
 
         self.log("recon", self.epoch_history['recon_loss'][-1], prog_bar=True)
+        self.log("parallel_loss", self.epoch_history['parallel_loss'][-1], prog_bar=True)
+        self.log("parallel_mse", self.epoch_history['parallel_mse'][-1], prog_bar=True)
+        self.log("parallel_recon", self.epoch_history['parallel_recon'][-1], prog_bar=True)
         self.log("r2_mean", self.epoch_history['r2_mean'][-1], prog_bar=True)
         self.log("adv_loss", self.epoch_history['adv_loss'][-1], prog_bar=True)
         self.log("acc_pert", self.epoch_history['acc_perts'][-1], prog_bar=True)
@@ -604,10 +637,11 @@ class CPATrainingPlan(TrainingPlan):
                                                            'mixup_lambda': 1.0,
                                                        })
 
-        recon_loss, kl_loss = self.module.loss(
+        recon_loss, kl_loss, parallel_loss, parallel_mse, parallel_recon = self.module.loss(
             tensors=batch,
             inference_outputs=inf_outputs,
             generative_outputs=gen_outputs,
+            parallel_recon_weight_active=self.parallel_recon_weight_active,
         )
 
         adv_results = {'adv_loss': 0.0, 'cycle_loss': 0.0, 'penalty_adv': 0.0,
@@ -626,6 +660,9 @@ class CPATrainingPlan(TrainingPlan):
         results.update({'disnt_after': disnt_after})
         results.update({'KL': kl_loss.item()})
         results.update({'recon_loss': recon_loss.item()})
+        results.update({'parallel_loss': parallel_loss.item()})
+        results.update({'parallel_mse': parallel_mse.item()})
+        results.update({'parallel_recon': parallel_recon.item()})
         results.update({'cpa_metric': r2_mean + 0.5 * r2_var + math.e ** (disnt_after - disnt_basal)})
 
         return results
@@ -651,6 +688,9 @@ class CPATrainingPlan(TrainingPlan):
         self.log('val_r2_mean', self.epoch_history['r2_mean'][-1], prog_bar=True)
         self.log('val_r2_var', self.epoch_history['r2_var'][-1], prog_bar=False)
         self.log('val_KL', self.epoch_history['KL'][-1], prog_bar=True)
+        self.log('val_parallel_loss', self.epoch_history['parallel_loss'][-1], prog_bar=True)
+        self.log('val_parallel_mse', self.epoch_history['parallel_mse'][-1], prog_bar=True)
+        self.log('val_parallel_recon', self.epoch_history['parallel_recon'][-1], prog_bar=True)
 
         if self.current_epoch % self.n_epochs_verbose == self.n_epochs_verbose - 1:
             print(f'\ndisnt_basal = {self.epoch_history["disnt_basal"][-1]}')

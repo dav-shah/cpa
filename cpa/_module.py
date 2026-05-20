@@ -89,6 +89,9 @@ class CPAModule(BaseModuleClass):
                  seed: int = 0,
                  deg_mask_lookup: Optional[np.ndarray] = None,
                  deg_mask_r2_lookup: Optional[np.ndarray] = None,
+                 use_parallel_encoder: bool = False,
+                 parallel_distill_weight: float = 1.0,
+                 parallel_recon_weight: float = 0.01,
                  ):
         super().__init__()
 
@@ -113,6 +116,9 @@ class CPAModule(BaseModuleClass):
         self.recon_loss = recon_loss
         self.doser_type = doser_type
         self.variational = variational
+        self.use_parallel_encoder = use_parallel_encoder
+        self.parallel_distill_weight = parallel_distill_weight
+        self.parallel_recon_weight = parallel_recon_weight
 
         self.covars_encoder = covars_encoder
 
@@ -142,6 +148,36 @@ class CPAModule(BaseModuleClass):
                 activation_fn=nn.ReLU,
                 output_activation='linear',
             )
+        
+        if self.use_parallel_encoder:
+            if variational:
+                self.parallel_encoder = Encoder(
+                    n_genes,
+                    n_latent,
+                    var_activation=nn.Softplus(),
+                    n_hidden=n_hidden_encoder,
+                    n_layers=n_layers_encoder,
+                    use_batch_norm=use_batch_norm_encoder,
+                    use_layer_norm=use_layer_norm_encoder,
+                    dropout_rate=dropout_rate_encoder,
+                    activation_fn=nn.ReLU,
+                    return_dist=True,
+                )
+            else:
+                self.parallel_encoder = VanillaEncoder(
+                    n_input=n_genes,
+                    n_output=n_latent,
+                    n_cat_list=[],
+                    n_hidden=n_hidden_encoder,
+                    n_layers=n_layers_encoder,
+                    use_batch_norm=use_batch_norm_encoder,
+                    use_layer_norm=use_layer_norm_encoder,
+                    dropout_rate=dropout_rate_encoder,
+                    activation_fn=nn.ReLU,
+                    output_activation='linear',
+                )
+            # Initialize with basal encoder's weights
+            self.parallel_encoder.load_state_dict(self.encoder.state_dict())
 
         # Decoder components
         if self.recon_loss in ['zinb', 'nb']:
@@ -320,6 +356,13 @@ class CPAModule(BaseModuleClass):
         z_no_pert = z_basal + z_covs
         z_no_pert_corrected = z_basal + z_covs_wo_batch
 
+        z_parallel = None
+        if self.use_parallel_encoder:
+            if self.variational:
+                _, z_parallel = self.parallel_encoder(x_)
+            else:
+                z_parallel = self.parallel_encoder(x_)
+
         return dict(
             z=z,
             z_corrected=z_corrected,
@@ -331,6 +374,7 @@ class CPAModule(BaseModuleClass):
             library=library,
             qz=qz,
             mixup_lambda=mixup_lambda,
+            z_parallel=z_parallel,
         )
 
     def _get_generative_input(self, tensors, inference_outputs, **kwargs):
@@ -374,8 +418,15 @@ class CPAModule(BaseModuleClass):
         pz = Normal(torch.zeros_like(z), torch.ones_like(z))
         return dict(px=px, pz=pz)
 
-    def loss(self, tensors, inference_outputs, generative_outputs):
-        """Computes the reconstruction loss (AE) or the ELBO (VAE)"""
+    def loss(self, tensors, inference_outputs, generative_outputs, parallel_recon_weight_active: Optional[float] = None):
+        """Computes the reconstruction loss (AE) or the ELBO (VAE)
+        
+        Parameters
+        ----------
+        parallel_recon_weight_active : Optional[float]
+            Override for parallel recon weight (used for warmup scheduling).
+            If None, uses module.parallel_recon_weight.
+        """
         x = tensors[CPA_REGISTRY_KEYS.X_KEY]
 
         px = generative_outputs['px']
@@ -391,7 +442,31 @@ class CPAModule(BaseModuleClass):
             from scvi.model import SCVI
             kl_loss = torch.zeros_like(recon_loss)
 
-        return recon_loss, kl_loss
+        parallel_loss = torch.tensor(0.0, device=recon_loss.device)
+        parallel_mse = torch.tensor(0.0, device=recon_loss.device)
+        parallel_recon = torch.tensor(0.0, device=recon_loss.device)
+
+        if self.use_parallel_encoder and inference_outputs.get("z_parallel") is not None:
+            z = inference_outputs["z"]
+            z_parallel = inference_outputs["z_parallel"]
+            # 1. Latent MSE Penalty (follow the primary CPA latent space)
+            # Detach z to ensure gradients only update the parallel encoder
+            parallel_mse = torch.nn.functional.mse_loss(z_parallel, z.detach())
+            
+            # 2. GEX Reconstruction Loss (ensure z_parallel is decodable to ground truth)
+            library = inference_outputs['library']
+            gen_outputs_parallel = self.generative(z_parallel, library=library)
+            px_parallel = gen_outputs_parallel['px']
+            parallel_recon = -px_parallel.log_prob(x).sum(dim=-1).mean()
+            
+            # Use active weight if provided (for warmup), otherwise use default
+            recon_weight = parallel_recon_weight_active if parallel_recon_weight_active is not None else self.parallel_recon_weight
+            
+            # Scale by individual weights
+            parallel_loss = (self.parallel_distill_weight * parallel_mse) + \
+                            (recon_weight * parallel_recon)
+
+        return recon_loss, kl_loss, parallel_loss, parallel_mse, parallel_recon
 
     def r2_metric(self, tensors, inference_outputs, generative_outputs, mode: str = 'lfc'):
         mode = mode.lower()
