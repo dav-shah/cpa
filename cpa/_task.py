@@ -52,6 +52,7 @@ class CPATrainingPlan(TrainingPlan):
             gradient_clip_value: Optional[float] = 3.0,
             drug_weights: Optional[list] = None,
             adv_loss: Optional[str] = 'cce',
+                n_epochs_parallel_distill_warmup: Optional[int] = None,
             n_epochs_parallel_recon_warmup: Optional[int] = None,
     ):
         """
@@ -121,6 +122,9 @@ class CPATrainingPlan(TrainingPlan):
             Weights for the perturbations to be used in the adversarial loss.
         adv_loss: Optional[str]
             Adversarial loss to be used. Can be either 'cce' or 'focal'.
+        n_epochs_parallel_distill_warmup: Optional[int]
+            Number of epochs to warm up the parallel distillation loss. During warmup,
+            parallel_distill_weight scales from 0 to full value.
         n_epochs_parallel_recon_warmup: Optional[int]
             Number of epochs to warmup the parallel reconstruction loss. During warmup, 
             parallel_recon_weight scales from 0 to full value. After warmup, it uses full weight.
@@ -181,6 +185,24 @@ class CPATrainingPlan(TrainingPlan):
 
         self.epoch_history = defaultdict(list)
         self.n_adv_perts = n_adv_perts
+        self.n_epochs_parallel_distill_warmup = n_epochs_parallel_distill_warmup
+        
+        # Automated Temporal Dynamics State
+        self.auto_temporal_dynamics = False
+        self.training_phase = 1
+        self.phase_epochs = 0
+        
+        self.phase_1_patience = 3
+        self.max_epochs_phase_1 = 15
+        
+        self.phase_2_patience = 7
+        self.max_epochs_phase_2 = 100
+        
+        self.max_epochs_phase_4 = 50
+        
+        self.best_val_recon = float('inf')
+        self.best_val_acc_pert = 0.0
+        self.patience_counter = 0
 
         self.perturbation_classifier = Classifier(
             n_input=self.module.n_latent,
@@ -210,8 +232,10 @@ class CPATrainingPlan(TrainingPlan):
             }
         )
 
-        self.drug_weights = torch.tensor(drug_weights).to(self.device) if drug_weights else torch.ones(
-            self.n_adv_perts).to(self.device)
+        self.register_buffer(
+            'drug_weights',
+            torch.tensor(drug_weights) if drug_weights is not None else torch.ones(self.n_adv_perts),
+        )
 
         self.adv_loss = adv_loss.lower()
         self.gamma = 2.0
@@ -237,13 +261,13 @@ class CPATrainingPlan(TrainingPlan):
             else:
                 return slope
         elif self.n_epochs_adv_warmup is not None:
-            current_epoch = self.current_epoch
+            current_epoch = self.phase_epochs if self.auto_temporal_dynamics else self.current_epoch
 
-            if self.n_epochs_pretrain_ae:
+            if not self.auto_temporal_dynamics and self.n_epochs_pretrain_ae:
                 current_epoch -= self.n_epochs_pretrain_ae
 
             if current_epoch <= self.n_epochs_adv_warmup:
-                proportion = current_epoch / self.n_epochs_adv_warmup
+                proportion = current_epoch / max(1, self.n_epochs_adv_warmup)
                 return slope * proportion
             else:
                 return slope
@@ -256,7 +280,7 @@ class CPATrainingPlan(TrainingPlan):
             current_epoch = self.current_epoch
 
             if self.n_epochs_pretrain_ae:
-                current_epoch -= self.current_epoch
+                current_epoch -= self.n_epochs_pretrain_ae
 
             if current_epoch <= self.n_epochs_mixup_warmup:
                 proportion = current_epoch / self.n_epochs_mixup_warmup
@@ -271,18 +295,46 @@ class CPATrainingPlan(TrainingPlan):
     def parallel_recon_weight_active(self):
         """Warmup schedule for parallel reconstruction loss weight."""
         if self.n_epochs_parallel_recon_warmup is not None:
-            current_epoch = self.current_epoch
+            # In auto-temporal mode we want the recon warmup to start at Phase 4,
+            # so use the phase-local epoch counter when in Phase 4.
+            if self.auto_temporal_dynamics and self.training_phase == 4:
+                current_epoch = self.phase_epochs
+            else:
+                current_epoch = self.current_epoch
 
-            if self.n_epochs_pretrain_ae:
-                current_epoch -= self.n_epochs_pretrain_ae
+                if self.n_epochs_pretrain_ae:
+                    current_epoch -= self.n_epochs_pretrain_ae
 
             if current_epoch <= self.n_epochs_parallel_recon_warmup:
-                proportion = current_epoch / self.n_epochs_parallel_recon_warmup
+                proportion = current_epoch / max(1, self.n_epochs_parallel_recon_warmup)
                 return self.module.parallel_recon_weight * proportion
             else:
                 return self.module.parallel_recon_weight
         else:
             return self.module.parallel_recon_weight
+
+    @property
+    def parallel_distill_weight_active(self):
+        """Warmup schedule for parallel distillation loss weight."""
+        if self.auto_temporal_dynamics and self.training_phase != 4:
+            return 0.0
+            
+        if self.n_epochs_parallel_distill_warmup is not None:
+            if self.auto_temporal_dynamics and self.training_phase == 4:
+                current_epoch = self.phase_epochs
+            else:
+                current_epoch = self.current_epoch
+
+                if self.n_epochs_pretrain_ae:
+                    current_epoch -= self.n_epochs_pretrain_ae
+
+            if current_epoch <= self.n_epochs_parallel_distill_warmup:
+                proportion = current_epoch / max(1, self.n_epochs_parallel_distill_warmup)
+                return self.module.parallel_distill_weight * proportion
+            else:
+                return self.module.parallel_distill_weight
+        else:
+            return self.module.parallel_distill_weight
 
     @property
     def do_start_adv_training(self):
@@ -391,9 +443,6 @@ class CPATrainingPlan(TrainingPlan):
                     list(filter(lambda p: p.requires_grad, self.module.pert_network.pert_embedding.parameters())) + \
                     list(filter(lambda p: p.requires_grad, self.module.covars_embeddings.parameters()))
 
-        if self.module.use_parallel_encoder:
-            ae_params += list(filter(lambda p: p.requires_grad, self.module.parallel_encoder.parameters()))
-
         if self.module.recon_loss in ['zinb', 'nb']:
             ae_params += [self.module.px_r]
 
@@ -403,6 +452,21 @@ class CPATrainingPlan(TrainingPlan):
             weight_decay=self.wd)
 
         scheduler_autoencoder = StepLR(optimizer_autoencoder, step_size=self.step_size_lr, gamma=0.9)
+        
+        optimizers = [optimizer_autoencoder]
+        schedulers = [scheduler_autoencoder]
+
+        # Parallel Encoder Optimizer
+        if self.module.use_parallel_encoder:
+            parallel_params = list(filter(lambda p: p.requires_grad, self.module.parallel_encoder.parameters()))
+            optimizer_parallel = torch.optim.Adam(
+                parallel_params,
+                lr=self.lr,
+                weight_decay=self.wd)
+            scheduler_parallel = StepLR(optimizer_parallel, step_size=self.step_size_lr, gamma=0.9)
+            
+            optimizers.append(optimizer_parallel)
+            schedulers.append(scheduler_parallel)
 
         doser_params = list(filter(lambda p: p.requires_grad, self.module.pert_network.dosers.parameters()))
         optimizer_doser = torch.optim.Adam(
@@ -419,8 +483,8 @@ class CPATrainingPlan(TrainingPlan):
             weight_decay=self.adv_wd)
         scheduler_adversaries = StepLR(optimizer_adversaries, step_size=self.step_size_lr, gamma=0.9)
 
-        optimizers = [optimizer_autoencoder, optimizer_doser, optimizer_adversaries]
-        schedulers = [scheduler_autoencoder, scheduler_doser, scheduler_adversaries]
+        optimizers.extend([optimizer_doser, optimizer_adversaries])
+        schedulers.extend([scheduler_doser, scheduler_adversaries])
 
         if self.step_size_lr is not None:
             return optimizers, schedulers
@@ -428,7 +492,17 @@ class CPATrainingPlan(TrainingPlan):
             return optimizers
 
     def training_step(self, batch, batch_idx):
-        opt, opt_doser, opt_adv = self.optimizers()
+        opts = self.optimizers()
+        opt = opts[0]
+        
+        if self.module.use_parallel_encoder:
+            opt_parallel = opts[1]
+            opt_doser = opts[2]
+            opt_adv = opts[3]
+        else:
+            opt_parallel = None
+            opt_doser = opts[1]
+            opt_adv = opts[2]
 
         mixup_alpha = self.alpha_mixup
 
@@ -443,138 +517,221 @@ class CPATrainingPlan(TrainingPlan):
             tensors=batch,
             inference_outputs=inf_outputs,
             generative_outputs=gen_outputs,
+            parallel_distill_weight_active=self.parallel_distill_weight_active,
             parallel_recon_weight_active=self.parallel_recon_weight_active,
         )
 
-        if self.do_start_adv_training:
-            if self.adv_steps is None:
+        z_basal = inf_outputs['z_basal']
+        
+        if self.auto_temporal_dynamics:
+            if self.training_phase == 1:
+                # Phase 1: AE Pre-train + Classifier Warmup
                 opt.zero_grad()
                 opt_doser.zero_grad()
-
-                z_basal = inf_outputs['z_basal']
-
-                adv_results = self.adversarial_loss(tensors=batch,
-                                                    z_basal=z_basal,
-                                                    mixup_lambda=mixup_lambda,
-                                                    compute_penalty=False)
-
-                loss = recon_loss + self.kl_weight * kl_loss - self.adv_lambda * adv_results['adv_loss'] + parallel_loss
-
+                loss = recon_loss + self.kl_weight * kl_loss
                 self.manual_backward(loss)
-
                 if self.do_clip_grad:
-                    self.clip_gradients(opt,
-                                        gradient_clip_val=self.gradient_clip_value,
-                                        gradient_clip_algorithm="norm")
-                    self.clip_gradients(opt_doser,
-                                        gradient_clip_val=self.gradient_clip_value,
-                                        gradient_clip_algorithm="norm")
+                    self.clip_gradients(opt, gradient_clip_val=self.gradient_clip_value, gradient_clip_algorithm="norm")
+                    self.clip_gradients(opt_doser, gradient_clip_val=self.gradient_clip_value, gradient_clip_algorithm="norm")
                 opt.step()
                 opt_doser.step()
 
+                # Update Adv (on detached basal to not backprop to AE)
                 opt_adv.zero_grad()
-
-                adv_results = self.adversarial_loss(tensors=batch,
-                                                    z_basal=z_basal.detach(),
-                                                    mixup_lambda=mixup_lambda,
-                                                    compute_penalty=True)
-
+                adv_results = self.adversarial_loss(tensors=batch, z_basal=z_basal.detach(),
+                                                    mixup_lambda=mixup_lambda, compute_penalty=True)
                 adv_loss = adv_results['adv_loss'] + self.pen_adv * adv_results['penalty_adv']
-
                 self.manual_backward(adv_loss)
-
                 if self.do_clip_grad:
-                    self.clip_gradients(opt_adv,
-                                        gradient_clip_val=self.gradient_clip_value,
-                                        gradient_clip_algorithm="norm")
-
+                    self.clip_gradients(opt_adv, gradient_clip_val=self.gradient_clip_value, gradient_clip_algorithm="norm")
                 opt_adv.step()
-
-            elif batch_idx % self.adv_steps != 0:
-                opt_adv.zero_grad()
-
-                z_basal = inf_outputs['z_basal']
-
-                adv_results = self.adversarial_loss(tensors=batch,
-                                                    z_basal=z_basal.detach(),
-                                                    mixup_lambda=mixup_lambda,
-                                                    compute_penalty=True)
-
-                adv_loss = adv_results['adv_loss'] + self.pen_adv * adv_results['penalty_adv']
-
-                self.manual_backward(adv_loss)
-
-                if self.do_clip_grad:
-                    self.clip_gradients(opt_adv,
-                                        gradient_clip_val=self.gradient_clip_value,
-                                        gradient_clip_algorithm="norm")
-
-                opt_adv.step()
-
-            # Model update
-            else:
+                
+            elif self.training_phase == 2:
+                # Phase 2: Full Adversarial
                 opt.zero_grad()
                 opt_doser.zero_grad()
-
-                z_basal = inf_outputs['z_basal']
-
-                adv_results = self.adversarial_loss(tensors=batch,
-                                                    z_basal=z_basal,
-                                                    mixup_lambda=mixup_lambda,
-                                                    compute_penalty=False)
-
-                loss = recon_loss + self.kl_weight * kl_loss - self.adv_lambda * adv_results['adv_loss'] + parallel_loss
-
+                
+                adv_results = self.adversarial_loss(tensors=batch, z_basal=z_basal,
+                                                    mixup_lambda=mixup_lambda, compute_penalty=False)
+                
+                loss = recon_loss + self.kl_weight * kl_loss - self.adv_lambda * adv_results['adv_loss']
                 self.manual_backward(loss)
-
+                
                 if self.do_clip_grad:
-                    self.clip_gradients(opt,
-                                        gradient_clip_val=self.gradient_clip_value,
-                                        gradient_clip_algorithm="norm")
-                    self.clip_gradients(opt_doser,
-                                        gradient_clip_val=self.gradient_clip_value,
-                                        gradient_clip_algorithm="norm")
+                    self.clip_gradients(opt, gradient_clip_val=self.gradient_clip_value, gradient_clip_algorithm="norm")
+                    self.clip_gradients(opt_doser, gradient_clip_val=self.gradient_clip_value, gradient_clip_algorithm="norm")
                 opt.step()
                 opt_doser.step()
+                
+                # Update Adv
+                opt_adv.zero_grad()
+                adv_results = self.adversarial_loss(tensors=batch, z_basal=z_basal.detach(),
+                                                    mixup_lambda=mixup_lambda, compute_penalty=True)
+                adv_loss = adv_results['adv_loss'] + self.pen_adv * adv_results['penalty_adv']
+                self.manual_backward(adv_loss)
+                if self.do_clip_grad:
+                    self.clip_gradients(opt_adv, gradient_clip_val=self.gradient_clip_value, gradient_clip_algorithm="norm")
+                opt_adv.step()
+                
+            elif self.training_phase == 3:
+                # Phase 3: Transition (Frozen) - Do nothing
+                adv_results = self.adversarial_loss(tensors=batch, z_basal=z_basal.detach(),
+                                                    mixup_lambda=mixup_lambda, compute_penalty=False)
+                pass
+                
+            elif self.training_phase == 4:
+                # Phase 4: Student Distillation
+                # Skip AE/Doser/Adv updates. Just do parallel
+                adv_results = self.adversarial_loss(tensors=batch, z_basal=z_basal.detach(),
+                                                    mixup_lambda=mixup_lambda, compute_penalty=False)
+                
+                if opt_parallel is not None:
+                    opt_parallel.zero_grad()
+                    self.manual_backward(parallel_loss)
+                    if self.do_clip_grad:
+                        self.clip_gradients(opt_parallel, gradient_clip_val=self.gradient_clip_value, gradient_clip_algorithm="norm")
+                    opt_parallel.step()
 
         else:
-            opt.zero_grad()
-            opt_doser.zero_grad()
+            # Legacy logic
+            if self.do_start_adv_training and self.adv_steps is None:
+                # Always run model update + adversary update every step
+                opt.zero_grad()
+                opt_doser.zero_grad()
 
-            z_basal = inf_outputs['z_basal']
+                z_basal = inf_outputs['z_basal']
 
-            loss = recon_loss + self.kl_weight * kl_loss + parallel_loss
+                adv_results = self.adversarial_loss(tensors=batch,
+                                                    z_basal=z_basal,
+                                                    mixup_lambda=mixup_lambda,
+                                                    compute_penalty=False)
 
-            self.manual_backward(loss)
+                loss = recon_loss + self.kl_weight * kl_loss - self.adv_lambda * adv_results['adv_loss'] + parallel_loss
 
-            if self.do_clip_grad:
-                self.clip_gradients(opt,
-                                    gradient_clip_val=self.gradient_clip_value,
-                                    gradient_clip_algorithm="norm")
-                self.clip_gradients(opt_doser,
-                                    gradient_clip_val=self.gradient_clip_value,
-                                    gradient_clip_algorithm="norm")
+                self.manual_backward(loss)
 
-            opt.step()
-            opt_doser.step()
+                if self.do_clip_grad:
+                    self.clip_gradients(opt,
+                                        gradient_clip_val=self.gradient_clip_value,
+                                        gradient_clip_algorithm="norm")
+                    self.clip_gradients(opt_doser,
+                                        gradient_clip_val=self.gradient_clip_value,
+                                        gradient_clip_algorithm="norm")
+                opt.step()
+                opt_doser.step()
 
-            opt_adv.zero_grad()
+                opt_adv.zero_grad()
 
-            adv_results = self.adversarial_loss(tensors=batch,
-                                                z_basal=z_basal.detach(),
-                                                mixup_lambda=mixup_lambda,
-                                                compute_penalty=True)
+                adv_results = self.adversarial_loss(tensors=batch,
+                                                    z_basal=z_basal.detach(),
+                                                    mixup_lambda=mixup_lambda,
+                                                    compute_penalty=True)
 
-            adv_loss = adv_results['adv_loss'] + self.pen_adv * adv_results['penalty_adv']
+                adv_loss = adv_results['adv_loss'] + self.pen_adv * adv_results['penalty_adv']
 
-            self.manual_backward(adv_loss)
+                self.manual_backward(adv_loss)
 
-            if self.do_clip_grad:
-                self.clip_gradients(opt_adv,
-                                    gradient_clip_val=self.gradient_clip_value,
-                                    gradient_clip_algorithm="norm")
+                if self.do_clip_grad:
+                    self.clip_gradients(opt_adv,
+                                        gradient_clip_val=self.gradient_clip_value,
+                                        gradient_clip_algorithm="norm")
 
-            opt_adv.step()
+                opt_adv.step()
+
+            elif self.do_start_adv_training and batch_idx % self.adv_steps != 0:
+                # Intermediate steps: update only adversary
+                opt_adv.zero_grad()
+
+                z_basal = inf_outputs['z_basal']
+
+                adv_results = self.adversarial_loss(tensors=batch,
+                                                    z_basal=z_basal.detach(),
+                                                    mixup_lambda=mixup_lambda,
+                                                    compute_penalty=True)
+
+                adv_loss = adv_results['adv_loss'] + self.pen_adv * adv_results['penalty_adv']
+
+                self.manual_backward(adv_loss)
+
+                if self.do_clip_grad:
+                    self.clip_gradients(opt_adv,
+                                        gradient_clip_val=self.gradient_clip_value,
+                                        gradient_clip_algorithm="norm")
+
+                opt_adv.step()
+
+            elif self.do_start_adv_training:
+                # Model update step (every adv_steps)
+                opt.zero_grad()
+                opt_doser.zero_grad()
+
+                z_basal = inf_outputs['z_basal']
+
+                adv_results = self.adversarial_loss(tensors=batch,
+                                                    z_basal=z_basal,
+                                                    mixup_lambda=mixup_lambda,
+                                                    compute_penalty=False)
+
+                loss = recon_loss + self.kl_weight * kl_loss - self.adv_lambda * adv_results['adv_loss'] + parallel_loss
+
+                self.manual_backward(loss)
+
+                if self.do_clip_grad:
+                    self.clip_gradients(opt,
+                                        gradient_clip_val=self.gradient_clip_value,
+                                        gradient_clip_algorithm="norm")
+                    self.clip_gradients(opt_doser,
+                                        gradient_clip_val=self.gradient_clip_value,
+                                        gradient_clip_algorithm="norm")
+                opt.step()
+                opt_doser.step()
+
+            else:
+                # Before adversary training starts: train AE/doser, then update adv on detached basal
+                opt.zero_grad()
+                opt_doser.zero_grad()
+
+                z_basal = inf_outputs['z_basal']
+
+                loss = recon_loss + self.kl_weight * kl_loss + parallel_loss
+
+                self.manual_backward(loss)
+
+                if self.do_clip_grad:
+                    self.clip_gradients(opt,
+                                        gradient_clip_val=self.gradient_clip_value,
+                                        gradient_clip_algorithm="norm")
+                    self.clip_gradients(opt_doser,
+                                        gradient_clip_val=self.gradient_clip_value,
+                                        gradient_clip_algorithm="norm")
+
+                opt.step()
+                opt_doser.step()
+
+                opt_adv.zero_grad()
+
+                adv_results = self.adversarial_loss(tensors=batch,
+                                                    z_basal=z_basal.detach(),
+                                                    mixup_lambda=mixup_lambda,
+                                                    compute_penalty=True)
+
+                adv_loss = adv_results['adv_loss'] + self.pen_adv * adv_results['penalty_adv']
+
+                self.manual_backward(adv_loss)
+
+                if self.do_clip_grad:
+                    self.clip_gradients(opt_adv,
+                                        gradient_clip_val=self.gradient_clip_value,
+                                        gradient_clip_algorithm="norm")
+
+                opt_adv.step()
+                
+                if opt_parallel is not None:
+                    opt_parallel.zero_grad()
+                    self.manual_backward(parallel_loss)
+                    if self.do_clip_grad:
+                        self.clip_gradients(opt_parallel, gradient_clip_val=self.gradient_clip_value, gradient_clip_algorithm="norm")
+                    opt_parallel.step()
 
         r2_mean, r2_var = self.module.r2_metric(batch, inf_outputs, gen_outputs, mode='direct')
 
@@ -596,18 +753,29 @@ class CPATrainingPlan(TrainingPlan):
         return results
 
     def training_epoch_end(self, outputs):
+        def safe_mean(key):
+            values = []
+            for output in outputs:
+                value = output[key]
+                if torch.is_tensor(value):
+                    value = value.detach().float().cpu().item() if value.numel() == 1 else value.detach().float().mean().cpu().item()
+                value = float(value)
+                if value != 0.0:
+                    values.append(value)
+            return np.mean(values) if len(values) > 0 else 0.0
+
         for key in self.metrics:
             if key in ['disnt_basal', 'disnt_after']:
                 self.epoch_history[key].append(0.0)
             else:
-                self.epoch_history[key].append(np.mean([output[key] for output in outputs if output[key] != 0.0]))
+                self.epoch_history[key].append(safe_mean(key))
 
         for covar, unique_covars in self.covars_encoder.items():
             if len(unique_covars) > 1:
                 key1, key2, key3 = f'adv_{covar}', f'penalty_{covar}', f'acc_{covar}'
-                self.epoch_history[key1].append(np.mean([output[key1] for output in outputs if output[key1] != 0.0]))
-                self.epoch_history[key2].append(np.mean([output[key2] for output in outputs if output[key2] != 0.0]))
-                self.epoch_history[key3].append(np.mean([output[key3] for output in outputs if output[key3] != 0.0]))
+                self.epoch_history[key1].append(safe_mean(key1))
+                self.epoch_history[key2].append(safe_mean(key2))
+                self.epoch_history[key3].append(safe_mean(key3))
 
         self.epoch_history['epoch'].append(self.current_epoch)
         self.epoch_history['mode'].append('train')
@@ -623,11 +791,31 @@ class CPATrainingPlan(TrainingPlan):
             if len(nc) > 1:
                 self.log(f'acc_{covar}', self.epoch_history[f'acc_{covar}'][-1], prog_bar=True)
 
-        if self.current_epoch > 1 and self.current_epoch % self.step_size_lr == 0:
-            sch, sch_doser, sch_adv = self.lr_schedulers()
-            sch.step()
-            sch_doser.step()
-            sch_adv.step()
+        if self.step_size_lr is not None:
+            schedulers = self.lr_schedulers()
+            sch_parallel = None
+            if self.module.use_parallel_encoder and len(schedulers) == 4:
+                sch_ae, sch_parallel, sch_doser, sch_adv = schedulers
+            elif len(schedulers) == 3:
+                sch_ae, sch_doser, sch_adv = schedulers
+            elif len(schedulers) == 2:
+                sch_ae, sch_adv = schedulers
+                sch_doser = None
+            else:
+                sch_ae = sch_doser = sch_adv = None
+
+            if self.current_epoch > 1 and self.current_epoch % self.step_size_lr == 0:
+                if sch_ae is not None:
+                    sch_ae.step()
+                if sch_doser is not None:
+                    sch_doser.step()
+                if sch_adv is not None:
+                    sch_adv.step()
+
+            if self.auto_temporal_dynamics and self.training_phase == 4 and self.module.use_parallel_encoder:
+                if self.phase_epochs > 0 and self.phase_epochs % self.step_size_lr == 0:
+                    if sch_parallel is not None:
+                        sch_parallel.step()
 
     def validation_step(self, batch, batch_idx):
         batch, mixup_lambda = self.module.mixup_data(batch, alpha=0.0)  # No mixup during validation
@@ -641,6 +829,7 @@ class CPATrainingPlan(TrainingPlan):
             tensors=batch,
             inference_outputs=inf_outputs,
             generative_outputs=gen_outputs,
+            parallel_distill_weight_active=self.parallel_distill_weight_active,
             parallel_recon_weight_active=self.parallel_recon_weight_active,
         )
 
@@ -650,6 +839,19 @@ class CPATrainingPlan(TrainingPlan):
             adv_results[f'adv_{covar}'] = 0.0
             adv_results[f'acc_{covar}'] = 0.0
             adv_results[f'penalty_{covar}'] = 0.0
+            
+        if self.auto_temporal_dynamics and self.training_phase >= 3:
+            # Skip adversarial loss completely when frozen
+            pass
+        else:
+            adv_results_real = self.adversarial_loss(tensors=batch,
+                                                z_basal=inf_outputs['z_basal'].detach(),
+                                                mixup_lambda=1.0,
+                                                compute_penalty=False)
+            # Update only the classification metrics we track
+            adv_results['acc_perts'] = adv_results_real.get('acc_perts', 0.0)
+            for covar in self.covars_encoder.keys():
+                adv_results[f'acc_{covar}'] = adv_results_real.get(f'acc_{covar}', 0.0)
 
         r2_mean, r2_var = self.module.r2_metric(batch, inf_outputs, gen_outputs, mode='direct')
         disnt_basal, disnt_after = self.module.disentanglement(batch, inf_outputs, gen_outputs)
@@ -668,19 +870,81 @@ class CPATrainingPlan(TrainingPlan):
         return results
 
     def validation_epoch_end(self, outputs):
+        def safe_mean(key):
+            values = []
+            for output in outputs:
+                value = output[key]
+                if torch.is_tensor(value):
+                    value = value.detach().float().cpu().item() if value.numel() == 1 else value.detach().float().mean().cpu().item()
+                value = float(value)
+                if value != 0.0:
+                    values.append(value)
+            return np.mean(values) if len(values) > 0 else 0.0
+
         for key in self.metrics:
-            self.epoch_history[key].append(np.mean([output[key] for output in outputs if output[key] != 0.0]))
+            self.epoch_history[key].append(safe_mean(key))
 
         for covar, unique_covars in self.covars_encoder.items():
             if len(unique_covars) > 1:
                 key1, key2, key3 = f'adv_{covar}', f'penalty_{covar}', f'acc_{covar}'
-                self.epoch_history[key1].append(np.mean([output[key1] for output in outputs if output[key1] != 0.0]))
-                self.epoch_history[key2].append(np.mean([output[key2] for output in outputs if output[key2] != 0.0]))
-                self.epoch_history[key3].append(np.mean([output[key3] for output in outputs if output[key3] != 0.0]))
+                self.epoch_history[key1].append(safe_mean(key1))
+                self.epoch_history[key2].append(safe_mean(key2))
+                self.epoch_history[key3].append(safe_mean(key3))
 
         self.epoch_history['epoch'].append(self.current_epoch)
         self.epoch_history['mode'].append('valid')
 
+        if self.auto_temporal_dynamics:
+            # Plateau Detection and Phase Transition
+            current_recon = self.epoch_history['recon_loss'][-1]
+            current_acc_pert = self.epoch_history['acc_perts'][-1]
+            
+            if self.training_phase == 1:
+                # Phase 1 -> 2 transition
+                if current_acc_pert > self.best_val_acc_pert + 0.001:
+                    self.best_val_acc_pert = current_acc_pert
+                    self.patience_counter = 0
+                else:
+                    pretrain_ae_epochs = getattr(self, 'n_epochs_pretrain_ae', None)
+                    if pretrain_ae_epochs is None or self.current_epoch >= pretrain_ae_epochs:
+                        self.patience_counter += 1
+                
+                if self.patience_counter >= self.phase_1_patience or self.phase_epochs >= self.max_epochs_phase_1:
+                    print(f"\n--- Transitioning to Phase 2 (Core CPA Training) at epoch {self.current_epoch} ---")
+                    self.training_phase = 2
+                    self.phase_epochs = 0
+                    self.patience_counter = 0
+                    self.best_val_recon = float('inf')
+            
+            elif self.training_phase == 2:
+                # Phase 2 -> 3 transition
+                if current_recon < self.best_val_recon - 0.001:
+                    self.best_val_recon = current_recon
+                    self.patience_counter = 0
+                else:
+                    if getattr(self, 'n_epochs_adv_warmup', 0) is None or self.phase_epochs >= getattr(self, 'n_epochs_adv_warmup', 0):
+                        self.patience_counter += 1
+                
+                if self.patience_counter >= self.phase_2_patience or self.phase_epochs >= self.max_epochs_phase_2:
+                    print(f"\n--- Transitioning to Phase 3 (Freeze Core) at epoch {self.current_epoch} ---")
+                    self.training_phase = 3
+                    self.phase_epochs = 0
+                    self.patience_counter = 0
+                    
+                    # If we use parallel encoder, immediately jump to Phase 4
+                    if self.module.use_parallel_encoder:
+                        print(f"--- Transitioning to Phase 4 (Student Distillation) at epoch {self.current_epoch} ---")
+                        self.training_phase = 4
+                        self.module.parallel_recon_weight = 0.0 # Force pure distillation
+                        
+            elif self.training_phase == 4:
+                # Phase 4 handles its own internal clock
+                if self.phase_epochs >= self.max_epochs_phase_4:
+                    print(f"\n--- Phase 4 Complete at epoch {self.current_epoch}. Waiting for Early Stopping ---")
+                    self.trainer.should_stop = True
+                    
+            self.phase_epochs += 1
+            
         self.log('val_recon', self.epoch_history['recon_loss'][-1], prog_bar=True)
         self.log('cpa_metric', np.mean([output['cpa_metric'] for output in outputs]), prog_bar=False)
         self.log('disnt_basal', self.epoch_history['disnt_basal'][-1], prog_bar=True)

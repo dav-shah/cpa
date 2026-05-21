@@ -510,6 +510,12 @@ class CPA(BaseModelClass):
         save_path: Optional[str] = None,
         check_val_every_n_epoch: int = 10,
         early_stopping_patience: int = 10,
+        auto_temporal_dynamics: bool = False,
+        phase_1_patience: int = 3,
+        phase_2_patience: int = 7,
+        max_epochs_phase_1: int = 15,
+        max_epochs_phase_2: int = 100,
+        max_epochs_phase_4: int = 50,
         **trainer_kwargs,
     ):
         """
@@ -604,6 +610,16 @@ class CPA(BaseModelClass):
             **plan_kwargs,
             drug_weights=drug_weights,
         )
+        
+        # Apply Temporal Dynamics Settings
+        self.training_plan.auto_temporal_dynamics = auto_temporal_dynamics
+        if auto_temporal_dynamics:
+            self.training_plan.phase_1_patience = phase_1_patience
+            self.training_plan.phase_2_patience = phase_2_patience
+            self.training_plan.max_epochs_phase_1 = max_epochs_phase_1
+            self.training_plan.max_epochs_phase_2 = max_epochs_phase_2
+            self.training_plan.max_epochs_phase_4 = max_epochs_phase_4
+            
         trainer_kwargs["early_stopping"] = False
         trainer_kwargs["check_val_every_n_epoch"] = check_val_every_n_epoch
 

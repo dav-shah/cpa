@@ -418,11 +418,21 @@ class CPAModule(BaseModuleClass):
         pz = Normal(torch.zeros_like(z), torch.ones_like(z))
         return dict(px=px, pz=pz)
 
-    def loss(self, tensors, inference_outputs, generative_outputs, parallel_recon_weight_active: Optional[float] = None):
+    def loss(
+        self,
+        tensors,
+        inference_outputs,
+        generative_outputs,
+        parallel_distill_weight_active: Optional[float] = None,
+        parallel_recon_weight_active: Optional[float] = None,
+    ):
         """Computes the reconstruction loss (AE) or the ELBO (VAE)
         
         Parameters
         ----------
+        parallel_distill_weight_active : Optional[float]
+            Override for parallel distillation weight (used for warmup scheduling).
+            If None, uses module.parallel_distill_weight.
         parallel_recon_weight_active : Optional[float]
             Override for parallel recon weight (used for warmup scheduling).
             If None, uses module.parallel_recon_weight.
@@ -459,11 +469,12 @@ class CPAModule(BaseModuleClass):
             px_parallel = gen_outputs_parallel['px']
             parallel_recon = -px_parallel.log_prob(x).sum(dim=-1).mean()
             
-            # Use active weight if provided (for warmup), otherwise use default
+            # Use active weights if provided (for warmup), otherwise use defaults
+            distill_weight = parallel_distill_weight_active if parallel_distill_weight_active is not None else self.parallel_distill_weight
             recon_weight = parallel_recon_weight_active if parallel_recon_weight_active is not None else self.parallel_recon_weight
             
             # Scale by individual weights
-            parallel_loss = (self.parallel_distill_weight * parallel_mse) + \
+            parallel_loss = (distill_weight * parallel_mse) + \
                             (recon_weight * parallel_recon)
 
         return recon_loss, kl_loss, parallel_loss, parallel_mse, parallel_recon
